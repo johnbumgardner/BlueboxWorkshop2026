@@ -2,6 +2,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { trace } = require('@opentelemetry/api');
 
 const port = Number(process.env.PORT || 8088);
 const paymentUrl = process.env.PAYMENT_URL || 'http://localhost:4004';
@@ -47,7 +48,14 @@ const database = async (url, options = {}) => {
     releaseDatabaseConnection();
   }
 };
-const mapProduct = product => ({ ...product, priceCents: product.price_cents, price_cents: undefined });
+// Flash Sale: catalog, cart and checkout all price through mapProduct, so the shown price is the charged price.
+const flashSaleProductIds = new Set((process.env.FLASH_SALE_PRODUCTS ?? 'orbit-lamp,night-hoodie').split(',').map(id => id.trim()).filter(Boolean));
+const flashSaleDiscountPercent = Math.min(100, Math.max(0, Number(process.env.FLASH_SALE_DISCOUNT_PERCENT ?? 20) || 0));
+const mapProduct = product => {
+  const onSale = flashSaleProductIds.has(product.id) && flashSaleDiscountPercent > 0;
+  const priceCents = onSale ? Math.round(product.price_cents * (100 - flashSaleDiscountPercent) / 100) : product.price_cents;
+  return { ...product, priceCents, originalPriceCents: product.price_cents, onSale, discountPercent: onSale ? flashSaleDiscountPercent : 0, price_cents: undefined };
+};
 const cart = userId => database(`/carts?user_id=eq.${encodeURIComponent(userId)}&select=quantity,products(*)`).then(items => items.map(item => ({ product: mapProduct(item.products), quantity: item.quantity })));
 
 async function route(req, res, url) {
@@ -56,18 +64,24 @@ async function route(req, res, url) {
   const userId = url.searchParams.get('userId') || 'workshop-user';
   if (url.pathname === '/api/cart' && req.method === 'GET') return send(res, 200, await cart(userId));
   if (url.pathname === '/api/cart' && req.method === 'POST') {
-    const input = await readBody(req); const existing = await database(`/carts?user_id=eq.${encodeURIComponent(userId)}&product_id=eq.${encodeURIComponent(input.productId)}&select=quantity`);
-    const quantity = (existing[0]?.quantity || 0) + Number(input.quantity || 1);
-    await database('/carts', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=representation' }, body: JSON.stringify({ user_id: userId, product_id: input.productId, quantity }) });
-    return send(res, 200, await cart(userId));
+    const input = await readBody(req);
+    trace.getActiveSpan()?.setAttributes({ 'product.id': String(input.productId), 'product.on_sale': flashSaleProductIds.has(input.productId) });
+    // One cart read and one upsert: the read gives the current quantity and the rest of the response.
+    const items = await cart(userId); const existing = items.find(item => item.product.id === input.productId);
+    const quantity = (existing?.quantity || 0) + Number(input.quantity || 1);
+    const [saved] = await database('/carts?select=quantity,products(*)', { method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=representation' }, body: JSON.stringify({ user_id: userId, product_id: input.productId, quantity }) });
+    const item = { product: mapProduct(saved.products), quantity: saved.quantity };
+    return send(res, 200, existing ? items.map(entry => entry === existing ? item : entry) : [...items, item]);
   }
   if (url.pathname === '/api/cart' && req.method === 'DELETE') { await database(`/carts?user_id=eq.${encodeURIComponent(userId)}`, { method: 'DELETE' }); return send(res, 204, null); }
   if (url.pathname === '/api/checkout' && req.method === 'POST') {
     const input = await readBody(req); const items = await cart(userId); if (!items.length) return send(res, 400, { error: 'Your cart is empty' });
     const totalCents = items.reduce((total, item) => total + item.product.priceCents * item.quantity, 0);
     const orderId = `order_${randomUUID().slice(0, 8)}`;
+    trace.getActiveSpan()?.setAttributes({ 'order.id': orderId, 'order.total_cents': totalCents, 'product.ids': items.map(item => item.product.id), 'order.flash_sale_items': items.filter(item => item.product.onSale).length });
+    // Payment answers in ~10 ms; the timeout only guards a hung charge. A retry is safe: payment dedupes by orderId.
     const charge = attempt => {
-      const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 150);
+      const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 1000);
       return fetch(`${paymentUrl}/charge`, { method: 'POST', signal: controller.signal, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ amountCents: totalCents, email: input.email, orderId, attempt, cardLast4: input.cardNumber?.slice(-4) }) }).then(response => response.json()).finally(() => clearTimeout(timeout));
     };
     let payment;
